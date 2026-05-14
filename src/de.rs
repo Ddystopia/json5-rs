@@ -84,6 +84,37 @@ impl<'de> Deserializer<'de> {
         self.peek().ok_or_else(|| Error::new(eof))
     }
 
+    #[cfg(feature = "spanned")]
+    fn start_span(&mut self) -> Result<crate::spanned::SpannedOffsetGuard> {
+        self.skip_whitespace()?;
+
+        let offset = self
+            .peek()
+            .map(|(offset, _)| offset)
+            .unwrap_or(self.input.len());
+
+        Ok(crate::spanned::start_span(offset))
+    }
+
+    #[cfg(feature = "spanned")]
+    fn end_span(&mut self, guard: crate::spanned::SpannedOffsetGuard) {
+        let offset = self
+            .peek()
+            .map(|(offset, _)| offset)
+            .unwrap_or(self.input.len());
+
+        guard.end(offset);
+    }
+
+    fn with_span<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        #[cfg(feature = "spanned")]
+        let guard = self.start_span()?;
+        let res = f(self);
+        #[cfg(feature = "spanned")]
+        self.end_span(guard);
+        res
+    }
+
     fn expect_char(
         &mut self,
         expected: char,
@@ -542,25 +573,27 @@ impl<'de> Deserializer<'de> {
 macro_rules! deserialize_number {
     ($method:ident) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-            let (offset, number) = self.parse_number()?;
-            match number {
-                NumberResult::U128(u) => {
-                    if let Ok(u) = u64::try_from(u) {
-                        visitor.visit_u64(u)
-                    } else {
-                        visitor.visit_u128(u)
+            self.with_span(|this| {
+                let (offset, number) = this.parse_number()?;
+                match number {
+                    NumberResult::U128(u) => {
+                        if let Ok(u) = u64::try_from(u) {
+                            visitor.visit_u64(u)
+                        } else {
+                            visitor.visit_u128(u)
+                        }
                     }
-                }
-                NumberResult::I128(i) => {
-                    if let Ok(i) = i64::try_from(i) {
-                        visitor.visit_i64(i)
-                    } else {
-                        visitor.visit_i128(i)
+                    NumberResult::I128(i) => {
+                        if let Ok(i) = i64::try_from(i) {
+                            visitor.visit_i64(i)
+                        } else {
+                            visitor.visit_i128(i)
+                        }
                     }
+                    NumberResult::F64(f) => visitor.visit_f64(f),
                 }
-                NumberResult::F64(f) => visitor.visit_f64(f),
-            }
-            .map_err(|err| self.with_position(err, offset))
+                .map_err(|err| this.with_position(err, offset))
+            })
         }
     };
 }
@@ -568,12 +601,14 @@ macro_rules! deserialize_number {
 macro_rules! deserialize_string {
     ($method:ident) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-            let (offset, s) = self.parse_string()?;
-            match s {
-                StringResult::Borrowed(borrowed) => visitor.visit_borrowed_str(borrowed),
-                StringResult::Owned(owned) => visitor.visit_string(owned),
-            }
-            .map_err(|err| self.with_position(err, offset))
+            self.with_span(|this| {
+                let (offset, s) = this.parse_string()?;
+                match s {
+                    StringResult::Borrowed(borrowed) => visitor.visit_borrowed_str(borrowed),
+                    StringResult::Owned(owned) => visitor.visit_string(owned),
+                }
+                .map_err(|err| this.with_position(err, offset))
+            })
         }
     };
 }
@@ -581,10 +616,12 @@ macro_rules! deserialize_string {
 macro_rules! deserialize_bytes {
     ($method:ident) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-            let (offset, s) = self.parse_string()?;
-            visitor
-                .visit_byte_buf(self.decode_hex(offset, &s)?)
-                .map_err(|err| self.with_position(err, offset))
+            self.with_span(|this| {
+                let (offset, s) = this.parse_string()?;
+                visitor
+                    .visit_byte_buf(this.decode_hex(offset, &s)?)
+                    .map_err(|err| this.with_position(err, offset))
+            })
         }
     };
 }
@@ -602,15 +639,18 @@ macro_rules! deserialize_collection {
     ) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
             self.skip_whitespace()?;
-            let offset = self.expect_char($open, $eof, $expected_opening)?;
-            let value = visitor
-                .$visit($access {
-                    de: self,
-                    first: true,
-                })
-                .map_err(|err| self.with_position(err, offset))?;
-            self.expect_collection_end($close, $eof, $expected_closing)?;
-            Ok(value)
+
+            self.with_span(|this| {
+                let offset = this.expect_char($open, $eof, $expected_opening)?;
+                let value = visitor
+                    .$visit($access {
+                        de: this,
+                        first: true,
+                    })
+                    .map_err(|err| this.with_position(err, offset))?;
+                this.expect_collection_end($close, $eof, $expected_closing)?;
+                Ok(value)
+            })
         }
     };
 }
@@ -661,29 +701,35 @@ impl<'de> serde::de::Deserializer<'de> for &mut Deserializer<'de> {
     );
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let (offset, b) = self.parse_bool()?;
-        visitor
-            .visit_bool(b)
-            .map_err(|err| self.with_position(err, offset))
+        self.with_span(|this| {
+            let (offset, b) = this.parse_bool()?;
+
+            visitor
+                .visit_bool(b)
+                .map_err(|err| this.with_position(err, offset))
+        })
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        self.skip_whitespace()?;
-        let (offset, c) = self.peek_or(ErrorCode::EofParsingValue)?;
-        if c == 'n' {
-            self.parse_null()?;
-            visitor.visit_none()
-        } else {
-            visitor.visit_some(&mut *self)
-        }
-        .map_err(|err| self.with_position(err, offset))
+        self.with_span(|this| {
+            let (offset, c) = this.peek_or(ErrorCode::EofParsingValue)?;
+            if c == 'n' {
+                this.parse_null()?;
+                visitor.visit_none()
+            } else {
+                visitor.visit_some(&mut *this)
+            }
+            .map_err(|err| this.with_position(err, offset))
+        })
     }
 
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let offset = self.parse_null()?;
-        visitor
-            .visit_unit()
-            .map_err(|err| self.with_position(err, offset))
+        self.with_span(|this| {
+            let offset = this.parse_null()?;
+            visitor
+                .visit_unit()
+                .map_err(|err| this.with_position(err, offset))
+        })
     }
 
     fn deserialize_unit_struct<V: Visitor<'de>>(
@@ -731,13 +777,14 @@ impl<'de> serde::de::Deserializer<'de> for &mut Deserializer<'de> {
         visitor: V,
     ) -> Result<V::Value> {
         self.skip_whitespace()?;
-        match self.peek_or(ErrorCode::EofParsingValue)? {
+
+        self.with_span(|this| match this.peek_or(ErrorCode::EofParsingValue)? {
             (offset, '{') => {
-                self.next();
+                this.next();
                 let value = visitor
-                    .visit_enum(VariantAccess { de: self })
-                    .map_err(|err| self.with_position(err, offset))?;
-                self.expect_collection_end(
+                    .visit_enum(VariantAccess { de: this })
+                    .map_err(|err| this.with_position(err, offset))?;
+                this.expect_collection_end(
                     '}',
                     ErrorCode::EofParsingObject,
                     ErrorCode::ExpectedClosingBrace,
@@ -746,25 +793,26 @@ impl<'de> serde::de::Deserializer<'de> for &mut Deserializer<'de> {
             }
             (offset, '"' | '\'') => visitor
                 .visit_enum(UnitVariantAccess {
-                    de: self,
+                    de: this,
                     map_key: false,
                 })
-                .map_err(|err| self.with_position(err, offset)),
-            (c, _) => Err(self.err_at(c, ErrorCode::ExpectedStringOrObject)),
-        }
+                .map_err(|err| this.with_position(err, offset)),
+            (c, _) => Err(this.err_at(c, ErrorCode::ExpectedStringOrObject)),
+        })
     }
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         self.skip_whitespace()?;
-        match self.peek_or(ErrorCode::EofParsingValue)? {
-            (_, 'n') => self.deserialize_unit(visitor),
-            (_, 't' | 'f') => self.deserialize_bool(visitor),
-            (_, '"' | '\'') => self.deserialize_str(visitor),
-            (_, '+' | '-' | '.' | 'I' | 'N' | '0'..='9') => self.deserialize_f64(visitor),
-            (_, '[') => self.deserialize_seq(visitor),
-            (_, '{') => self.deserialize_map(visitor),
-            (offset, _) => Err(self.err_at(offset, ErrorCode::ExpectedValue)),
-        }
+
+        self.with_span(|this| match this.peek_or(ErrorCode::EofParsingValue)? {
+            (_, 'n') => this.deserialize_unit(visitor),
+            (_, 't' | 'f') => this.deserialize_bool(visitor),
+            (_, '"' | '\'') => this.deserialize_str(visitor),
+            (_, '+' | '-' | '.' | 'I' | 'N' | '0'..='9') => this.deserialize_f64(visitor),
+            (_, '[') => this.deserialize_seq(visitor),
+            (_, '{') => this.deserialize_map(visitor),
+            (offset, _) => Err(this.err_at(offset, ErrorCode::ExpectedValue)),
+        })
     }
 
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {

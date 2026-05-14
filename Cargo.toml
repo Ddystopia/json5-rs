@@ -9,6 +9,9 @@ readme = "README.md"
 keywords = ["json5", "parser", "serde", "json", "jsonc"]
 edition = "2024"
 
+[features]
+spanned = []
+
 [dependencies]
 serde = "1"
 ucd-trie = "0.1.7"

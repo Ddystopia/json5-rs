@@ -117,6 +117,8 @@ mod de;
 pub mod char;
 mod error;
 mod ser;
+#[cfg(feature = "spanned")]
+mod spanned;
 
 #[allow(clippy::all, clippy::pedantic, dead_code)]
 mod unicode;
@@ -124,3 +126,5 @@ mod unicode;
 pub use de::{Deserializer, from_str};
 pub use error::{Error, ErrorCode, Position};
 pub use ser::{Serializer, to_string, to_writer};
+#[cfg(feature = "spanned")]
+pub use spanned::{Span, Spanned};
